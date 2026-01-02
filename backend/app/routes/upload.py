@@ -9,8 +9,8 @@ async def upload_doc(file: UploadFile = File(...)):
     file_path = save_upload(file)
     docs = load_and_split(file_path)
     db = get_vectorstore()
-    db.add_documents(docs)
-    db.persist()
+    if len(docs) > 0:
+        db.add_documents(docs)
     return {
         "status": "success",
         "message": f"Indexed {len(docs)} chunks from {file.filename}",
