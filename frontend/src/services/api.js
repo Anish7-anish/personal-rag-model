@@ -19,4 +19,9 @@ export const queryDocuments = async (payload) => {
   return data;
 };
 
+export const fetchDocuments = async () => {
+  const { data } = await api.get("/documents");
+  return data;
+};
+
 export default api;
