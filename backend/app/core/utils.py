@@ -1,5 +1,6 @@
 import os
 import re
+import hashlib
 from pathlib import Path
 from fastapi import UploadFile
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -13,10 +14,20 @@ BASE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 def save_upload(file: UploadFile) -> str:
     """Save uploaded file to disk and return the saved path."""
-    file_path = BASE_UPLOAD_DIR / file.filename
+    filename = Path(file.filename or "upload.bin").name
+    file_path = BASE_UPLOAD_DIR / filename
     with open(file_path, "wb") as f:
         f.write(file.file.read())
     return str(file_path)
+
+
+def compute_file_hash(file_path: str) -> str:
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 
 def load_and_split(file_path: str):
     """Load and chunk a file into text segments."""
@@ -41,7 +52,12 @@ def load_and_split(file_path: str):
         splitter = RecursiveCharacterTextSplitter(chunk_size=900, chunk_overlap=150)
 
     chunks = splitter.split_documents(documents)
-    for chunk in chunks:
+    for index, chunk in enumerate(chunks):
         cleaned = re.sub(r"\s+", " ", chunk.page_content).strip()
         chunk.page_content = f"{header}{cleaned}".strip()
+        metadata = dict(chunk.metadata or {})
+        metadata["source"] = filename
+        metadata["chunk_index"] = index
+        metadata["file_ext"] = ext
+        chunk.metadata = metadata
     return chunks

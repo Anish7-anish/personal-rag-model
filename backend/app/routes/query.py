@@ -1,24 +1,79 @@
-# backend/app/routes/query.py
-
-import json
 import re
+import uuid
 from pathlib import Path
+from time import perf_counter
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-import requests
-from app.core.vectorstore import get_vectorstore
-from app.core.rag_logger import log_query_event
-from app.config import OLLAMA_MODEL
+
+from app.config import LLM_MODEL, LLM_PROVIDER
+from app.core.document_store import get_document_store
+from app.core.llm_provider import generate_text
+from app.core.rag_logger import (
+    get_app_logger,
+    log_query_event,
+    log_trace_event,
+    preview_text,
+)
+
 
 router = APIRouter()
+logger = get_app_logger("personal_rag.query")
+
+TOP_K = 8
+MAX_CONTEXT_CHUNKS = 4
+WORK_INTENT_TERMS = {
+    "role",
+    "work",
+    "worked",
+    "working",
+    "job",
+    "position",
+    "employment",
+    "experience",
+}
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "me",
+    "my",
+    "now",
+    "of",
+    "on",
+    "or",
+    "right",
+    "the",
+    "to",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "who",
+    "with",
+    "you",
+    "your",
+}
+
 
 class QueryRequest(BaseModel):
     query: str
-
-
-TOP_K = 15
-MMR_FETCH_K = 50
-WORK_INTENT_TERMS = {"role", "work", "worked", "working", "job", "position", "employment", "experience"}
 
 
 def _extract_entity(query: str):
@@ -30,16 +85,8 @@ def _extract_entity(query: str):
     return None, False
 
 
-def _infer_subject_from_sources(docs):
-    sources = []
-    for doc in docs:
-        metadata = doc.metadata or {}
-        source = metadata.get("source")
-        if source:
-            sources.append(source)
-    if not sources:
-        return None
-    filenames = {Path(source).stem for source in sources}
+def _infer_subject_from_sources(chunks):
+    filenames = {Path(chunk["filename"]).stem for chunk in chunks if chunk.get("filename")}
     if len(filenames) != 1:
         return None
     name = next(iter(filenames))
@@ -71,28 +118,6 @@ def _expand_phrase_queries(phrases, tokens):
     return list(dict.fromkeys(expanded))
 
 
-def _doc_key(doc):
-    metadata = doc.metadata or {}
-    return (
-        metadata.get("source"),
-        metadata.get("page"),
-        metadata.get("section"),
-        doc.page_content[:200],
-    )
-
-
-def _lexical_score(doc, tokens, phrase_queries):
-    text = doc.page_content.lower()
-    score = 0
-    for phrase in phrase_queries:
-        if phrase.lower() in text:
-            score += 10
-    for token in tokens:
-        if token in text:
-            score += 1
-    return score
-
-
 def _extract_role_for_org(context: str, org: str):
     if not org:
         return None
@@ -104,172 +129,242 @@ def _extract_role_for_org(context: str, org: str):
     return None
 
 
+def _meaningful_tokens(query: str) -> set[str]:
+    tokens = set(re.findall(r"[a-z0-9]+", query.lower()))
+    return {
+        token
+        for token in tokens
+        if token not in STOPWORDS and (len(token) > 2 or token in WORK_INTENT_TERMS)
+    }
+
+
+def _score_chunk(chunk: dict, query: str, tokens: set[str], phrase_queries: list[str]) -> int:
+    text = chunk["content"].lower()
+    filename = (chunk.get("filename") or "").lower()
+    normalized_query = query.lower()
+    score = 0
+
+    if normalized_query and normalized_query in text:
+        score += 30
+
+    for phrase in phrase_queries:
+        phrase_lower = phrase.lower()
+        if phrase_lower in text:
+            score += 20
+        if phrase_lower in filename:
+            score += 5
+
+    for token in tokens:
+        if len(token) <= 1:
+            continue
+        score += min(text.count(token), 6) * 3
+        if token in filename:
+            score += 2
+
+    return score
+
+
+def _retrieve_chunks(query: str, top_k: int = TOP_K):
+    tokens = _meaningful_tokens(query)
+    phrase_queries = _expand_phrase_queries(_extract_phrases(query), tokens)
+    store = get_document_store()
+    chunks = store.list_chunks()
+    scored = []
+    for chunk in chunks:
+        score = _score_chunk(chunk, query, tokens, phrase_queries)
+        if score > 0:
+            scored.append(
+                {
+                    **chunk,
+                    "score": score,
+                }
+            )
+
+    scored.sort(
+        key=lambda chunk: (
+            chunk["score"],
+            chunk["document_updated_at"],
+            -chunk["chunk_index"],
+        ),
+        reverse=True,
+    )
+    return scored[:top_k], scored, tokens, phrase_queries
+
+
+def _serialize_retrieved_chunks(chunks: list[dict]) -> list[dict]:
+    return [
+        {
+            "id": chunk["id"],
+            "document_id": chunk["document_id"],
+            "filename": chunk["filename"],
+            "chunk_index": chunk["chunk_index"],
+            "score": chunk["score"],
+            "preview": preview_text(chunk["content"], 220),
+            "content": chunk["content"],
+            "metadata": chunk["metadata"],
+        }
+        for chunk in chunks
+    ]
+
+
+def _normalize_answer(output: str) -> str:
+    cleaned = output.strip()
+    if not cleaned:
+        return "I don't know."
+
+    lowered = cleaned.lower()
+    if lowered.startswith("i don't know") or lowered.startswith("i do not know"):
+        return "I don't know."
+
+    return cleaned
+
+
 @router.post("/query")
 async def query_docs(request: QueryRequest):
-    """
-    Retrieve top-k relevant chunks from Chroma and query Ollama model.
-    """
+    trace_id = uuid.uuid4().hex[:12]
+    start = perf_counter()
+
     try:
         query = request.query.strip()
         if not query:
-            return {"answer": "I don't know.", "sources": []}
+            return {"answer": "I don't know.", "sources": [], "trace_id": trace_id}
+
+        log_trace_event(
+            "query.received",
+            {
+                "query": query,
+                "provider": LLM_PROVIDER,
+                "model": LLM_MODEL,
+            },
+            trace_id=trace_id,
+        )
 
         entity, enforce_entity = _extract_entity(query)
-        tokens = set(re.findall(r"[a-z0-9]+", query.lower()))
-        retrieval_query = query
-        if tokens & WORK_INTENT_TERMS:
-            retrieval_query = f"{query} experience"
-        phrase_queries = _extract_phrases(query)
-        expanded_phrase_queries = _expand_phrase_queries(phrase_queries, tokens)
-        # Get stored embeddings
-        db = get_vectorstore()
-        try:
-            docs = db.max_marginal_relevance_search(
-                retrieval_query, k=TOP_K, fetch_k=MMR_FETCH_K
-            )
-            pairs = [(doc, None) for doc in docs]
-        except AttributeError:
-            try:
-                results = db.similarity_search_with_relevance_scores(
-                    retrieval_query, k=TOP_K
-                )
-                pairs = [(doc, score) for doc, score in results]
-            except AttributeError:
-                pairs = [
-                    (doc, None)
-                    for doc in db.similarity_search(retrieval_query, k=TOP_K)
-                ]
+        top_chunks, all_scored_chunks, tokens, phrase_queries = _retrieve_chunks(query, top_k=TOP_K)
 
-        if expanded_phrase_queries:
-            extra_pairs = []
-            for phrase in expanded_phrase_queries:
-                try:
-                    phrase_docs = db.similarity_search(phrase, k=3)
-                except AttributeError:
-                    phrase_docs = []
-                extra_pairs.extend([(doc, None) for doc in phrase_docs])
-            pairs.extend(extra_pairs)
+        log_trace_event(
+            "query.retrieved",
+            {
+                "query": query,
+                "candidate_count": len(all_scored_chunks),
+                "selected_count": len(top_chunks),
+                "top_chunks": _serialize_retrieved_chunks(top_chunks),
+            },
+            trace_id=trace_id,
+        )
 
-        pairs = [
-            (doc, score)
-            for doc, score in pairs
-            if doc.page_content and doc.page_content.strip()
-        ]
-        unique_pairs = {}
-        for doc, score in pairs:
-            key = _doc_key(doc)
-            if key not in unique_pairs:
-                unique_pairs[key] = (doc, score)
-        docs = [doc for doc, _ in unique_pairs.values()]
-        scores = [score for _, score in unique_pairs.values()]
-
-        docs = sorted(
-            docs,
-            key=lambda doc: _lexical_score(doc, tokens, expanded_phrase_queries),
-            reverse=True,
-        )[:TOP_K]
-        if not docs:
+        if not top_chunks:
+            answer = "I don't know."
             log_query_event(
                 {
+                    "trace_id": trace_id,
                     "query": query,
-                    "retrieval_query": retrieval_query,
-                    "phrase_queries": expanded_phrase_queries,
+                    "phrase_queries": phrase_queries,
                     "top_k": TOP_K,
                     "entity": entity,
                     "entity_in_context": False,
                     "context": "",
                     "retrieved": [],
-                    "answer": "I don't know.",
+                    "answer": answer,
                     "abstained": True,
-                    "model": OLLAMA_MODEL,
+                    "provider": LLM_PROVIDER,
+                    "model": LLM_MODEL,
+                    "duration_ms": round((perf_counter() - start) * 1000, 2),
                 }
             )
-            return {"answer": "I don't know.", "sources": []}
+            return {"answer": answer, "sources": [], "trace_id": trace_id}
 
-        # Combine context text
-        context = "\n\n".join([d.page_content for d in docs])
+        context_chunks = top_chunks[:MAX_CONTEXT_CHUNKS]
+        context = "\n\n".join(chunk["content"] for chunk in context_chunks)
         entity_in_context = True
         if entity and enforce_entity:
             entity_in_context = entity.lower() in context.lower()
             if not entity_in_context:
-                log_query_event(
+                answer = "I don't know."
+                log_trace_event(
+                    "query.entity_miss",
                     {
                         "query": query,
-                        "retrieval_query": retrieval_query,
-                        "phrase_queries": expanded_phrase_queries,
+                        "entity": entity,
+                    },
+                    trace_id=trace_id,
+                )
+                log_query_event(
+                    {
+                        "trace_id": trace_id,
+                        "query": query,
+                        "phrase_queries": phrase_queries,
                         "top_k": TOP_K,
                         "entity": entity,
                         "entity_enforced": enforce_entity,
                         "entity_in_context": False,
                         "context": context,
-                        "retrieved": [
-                            {
-                                "content": doc.page_content,
-                                "metadata": doc.metadata,
-                                "score": score,
-                            }
-                            for doc, score in zip(docs, scores)
-                        ],
-                        "answer": "I don't know.",
+                        "retrieved": _serialize_retrieved_chunks(top_chunks),
+                        "answer": answer,
                         "abstained": True,
-                        "model": OLLAMA_MODEL,
+                        "provider": LLM_PROVIDER,
+                        "model": LLM_MODEL,
+                        "duration_ms": round((perf_counter() - start) * 1000, 2),
                     }
                 )
-                return {"answer": "I don't know.", "sources": []}
+                return {"answer": answer, "sources": [], "trace_id": trace_id}
 
         role_hit = None
         if tokens & WORK_INTENT_TERMS and entity:
             role_hit = _extract_role_for_org(context, entity)
             if role_hit:
                 output = f"{role_hit}, {entity}"
-                sources = []
-                seen_sources = set()
-                for doc in docs:
-                    metadata = doc.metadata or {}
-                    source = metadata.get("source")
-                    if source and source not in seen_sources:
-                        sources.append(metadata)
-                        seen_sources.add(source)
-                    elif not source:
-                        sources.append(metadata)
-                log_query_event(
+                sources = [
+                    {
+                        "document_id": chunk["document_id"],
+                        "filename": chunk["filename"],
+                        "chunk_index": chunk["chunk_index"],
+                        "score": chunk["score"],
+                        "preview": chunk["preview"],
+                    }
+                    for chunk in top_chunks
+                ]
+                log_trace_event(
+                    "query.rule_hit",
                     {
                         "query": query,
-                        "retrieval_query": retrieval_query,
-                        "phrase_queries": expanded_phrase_queries,
+                        "rule": "role_for_org",
+                        "answer": output,
+                    },
+                    trace_id=trace_id,
+                )
+                log_query_event(
+                    {
+                        "trace_id": trace_id,
+                        "query": query,
+                        "phrase_queries": phrase_queries,
                         "top_k": TOP_K,
                         "entity": entity,
                         "entity_enforced": enforce_entity,
                         "entity_in_context": entity_in_context,
                         "context": context,
-                        "retrieved": [
-                            {
-                                "content": doc.page_content,
-                                "metadata": doc.metadata,
-                                "score": score,
-                            }
-                            for doc, score in zip(docs, scores)
-                        ],
+                        "retrieved": _serialize_retrieved_chunks(top_chunks),
                         "answer": output,
                         "abstained": False,
-                        "model": OLLAMA_MODEL,
+                        "provider": LLM_PROVIDER,
+                        "model": LLM_MODEL,
                         "rule_hit": "role_for_org",
+                        "duration_ms": round((perf_counter() - start) * 1000, 2),
                     }
                 )
-                return {"answer": output, "sources": sources}
+                return {"answer": output, "sources": sources, "trace_id": trace_id}
 
-        subject_hint = _infer_subject_from_sources(docs) or _infer_subject_from_context(context)
+        subject_hint = _infer_subject_from_sources(top_chunks) or _infer_subject_from_context(context)
         subject_line = ""
         if subject_hint:
             subject_line = (
-                f"The document is the resume of {subject_hint}. "
+                f"The document is about {subject_hint}. "
                 "All experience and skills refer to this person unless explicitly stated otherwise."
             )
 
-        # Prepare the prompt
-        prompt = f"""You are a helpful assistant.
-Answer the question using the following context only.
-If you don't know, say you don't know.
+        prompt = f"""You are a helpful assistant for a personal knowledge base.
+Answer the question using the provided context only.
+If the context is insufficient, say "I don't know."
 {subject_line}
 Context:
 {context}
@@ -280,72 +375,74 @@ Question:
 Answer:
 """
 
-        # Send to Ollama (local inference)
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={"model": OLLAMA_MODEL, "prompt": prompt},
-            stream=False,
-            timeout=120,
-        )
-
-        if response.status_code != 200:
-            raise HTTPException(status_code=500, detail="Error contacting Ollama API")
-
-        try:
-            payload = response.json()
-            output = payload.get("response", "")
-        except ValueError:
-            # Ollama may return newline-delimited JSON; aggregate response chunks.
-            lines = [line for line in response.text.splitlines() if line.strip()]
-            if not lines:
-                raise HTTPException(status_code=500, detail="Empty response from Ollama API")
-            output_parts = []
-            for line in lines:
-                try:
-                    chunk = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if "response" in chunk:
-                    output_parts.append(chunk["response"])
-            if not output_parts:
-                raise HTTPException(status_code=500, detail="Invalid JSON from Ollama API")
-            output = "".join(output_parts)
-
-        output = output.strip() or "I don't know."
-        sources = []
-        seen_sources = set()
-        for doc in docs:
-            metadata = doc.metadata or {}
-            source = metadata.get("source")
-            if source and source not in seen_sources:
-                sources.append(metadata)
-                seen_sources.add(source)
-            elif not source:
-                sources.append(metadata)
-        log_query_event(
+        log_trace_event(
+            "query.prompt_built",
             {
                 "query": query,
-                "retrieval_query": retrieval_query,
-                "phrase_queries": expanded_phrase_queries,
+                "context_chars": len(context),
+                "context_chunk_count": len(context_chunks),
+                "prompt_preview": preview_text(prompt, 600),
+            },
+            trace_id=trace_id,
+        )
+
+        output, llm_duration_ms = generate_text(prompt)
+        output = _normalize_answer(output)
+
+        log_trace_event(
+            "query.llm_response",
+            {
+                "query": query,
+                "provider": LLM_PROVIDER,
+                "model": LLM_MODEL,
+                "duration_ms": llm_duration_ms,
+                "answer_preview": preview_text(output, 400),
+            },
+            trace_id=trace_id,
+        )
+
+        sources = [
+            {
+                "document_id": chunk["document_id"],
+                "filename": chunk["filename"],
+                "chunk_index": chunk["chunk_index"],
+                "score": chunk["score"],
+                "preview": chunk["preview"],
+            }
+            for chunk in top_chunks
+        ]
+
+        total_duration_ms = round((perf_counter() - start) * 1000, 2)
+        log_query_event(
+            {
+                "trace_id": trace_id,
+                "query": query,
+                "phrase_queries": phrase_queries,
                 "top_k": TOP_K,
                 "entity": entity,
                 "entity_enforced": enforce_entity,
                 "entity_in_context": entity_in_context,
                 "context": context,
-                "retrieved": [
-                    {
-                        "content": doc.page_content,
-                        "metadata": doc.metadata,
-                        "score": score,
-                    }
-                    for doc, score in zip(docs, scores)
-                ],
+                "retrieved": _serialize_retrieved_chunks(top_chunks),
                 "answer": output,
                 "abstained": output == "I don't know.",
-                "model": OLLAMA_MODEL,
+                "provider": LLM_PROVIDER,
+                "model": LLM_MODEL,
+                "llm_duration_ms": llm_duration_ms,
+                "duration_ms": total_duration_ms,
             }
         )
-        return {"answer": output, "sources": sources}
+        logger.info(
+            "Answered trace_id=%s duration_ms=%s chunks=%s query=%s",
+            trace_id,
+            total_duration_ms,
+            len(top_chunks),
+            query,
+        )
+        return {"answer": output, "sources": sources, "trace_id": trace_id}
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Query failed trace_id=%s", trace_id)
+        raise HTTPException(status_code=500, detail=str(exc))

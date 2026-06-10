@@ -28,6 +28,7 @@ const QueryPanel = () => {
         role: "assistant",
         content: result.answer || "I don't know.",
         sources: result.sources || [],
+        traceId: result.trace_id || "",
       };
       setMessages((prev) => [...prev, assistantMessage]);
     } catch (err) {
@@ -54,13 +55,17 @@ const QueryPanel = () => {
         {messages.map((message, index) => (
           <div key={`${message.role}-${index}`} className={`chat-bubble ${message.role}`}>
             <p>{message.content}</p>
+            {message.traceId && <p className="trace-id">Trace ID: {message.traceId}</p>}
             {message.role === "assistant" && message.sources?.length > 0 && (
               <div className="sources">
                 <h4>Sources</h4>
                 <ul>
                   {message.sources.map((source, sourceIndex) => (
-                    <li key={`${source?.source || sourceIndex}-${sourceIndex}`}>
-                      {source?.source || JSON.stringify(source)}
+                    <li key={`${source?.document_id || sourceIndex}-${sourceIndex}`}>
+                      {source?.filename || "Unknown file"}
+                      {typeof source?.chunk_index === "number" ? `, chunk ${source.chunk_index + 1}` : ""}
+                      {typeof source?.score === "number" ? `, score ${source.score}` : ""}
+                      {source?.preview ? ` — ${source.preview}` : ""}
                     </li>
                   ))}
                 </ul>
