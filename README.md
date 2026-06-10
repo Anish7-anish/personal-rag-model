@@ -1,6 +1,14 @@
 # personal-rag-model
 Personal RAG app: build a persistent corpus about yourself, then query it with local retrieval and either Groq or Ollama for final answer generation.
 
+## Current Status
+- Persistent local corpus storage is working through `backend/data/rag_store.sqlite3`.
+- Uploads can come from the frontend or from the CLI indexing script.
+- Retrieval runs locally in the backend against the stored corpus.
+- Final answer generation works with Groq free tier and can fall back to Ollama.
+- Query traces and logs are written to `backend/data/logs/`.
+- The frontend can list indexed documents without exposing chunk text in the UI.
+
 ## Quickstart
 Backend (FastAPI + local SQLite corpus store + Groq free tier):
 ```bash
@@ -67,6 +75,13 @@ curl http://127.0.0.1:8000/
 ```
 You should see `llm_provider: groq` in the JSON response.
 
+Test one real query:
+```bash
+curl -X POST http://127.0.0.1:8000/api/query \
+  -H "Content-Type: application/json" \
+  -d '{"query":"Who is Anish?"}'
+```
+
 ## Add Documents
 From the UI:
 - Use the upload form in the frontend.
@@ -93,12 +108,46 @@ curl "http://127.0.0.1:8000/api/documents/<document_id>/chunks?limit=20"
 - App log: `backend/data/logs/app.log`
 - Query log: `backend/data/logs/rag_queries.jsonl`
 - Trace log: `backend/data/logs/rag_trace.jsonl`
+- Upload chunk previews are logged in the backend console during indexing.
 
 Useful debug endpoints:
 - `GET /api/debug/query-logs`
 - `GET /api/debug/traces`
 
 Each query response also returns a `trace_id` so you can match UI behavior to the trace log.
+
+## Secrets And Env Files
+- Commit `backend/.env.example`, not the real `backend/.env`.
+- Keep `GROQ_API_KEY` in `backend/.env` locally and in your deployment provider's secret manager in production.
+- Do not put backend secrets in the frontend. `VITE_*` variables are public to the browser.
+- If a secret is ever committed accidentally, rotate it immediately and replace it with a new key.
+
+Local backend example:
+```env
+LLM_PROVIDER=groq
+LLM_MODEL=llama-3.1-8b-instant
+GROQ_API_KEY=your_real_groq_api_key_here
+```
+
+Frontend example:
+```env
+VITE_API_BASE_URL=http://localhost:8000/api
+```
+
+## Portfolio Deployment Checklist
+Before connecting this to a public portfolio:
+- Add backend rate limiting so anonymous users cannot burn the Groq free tier.
+- Tighten CORS to your deployed portfolio domain instead of `*`.
+- Deploy the backend separately and set `VITE_API_BASE_URL` in the frontend to that hosted backend URL.
+- Keep `backend/data/uploads/` and `backend/data/rag_store.sqlite3` on persistent storage on the backend host.
+- Keep `GROQ_API_KEY` only on the backend host, never in the frontend bundle.
+
+Recommended order:
+1. Add rate limiting.
+2. Restrict CORS.
+3. Deploy the backend with persistent storage.
+4. Point the portfolio frontend to the deployed backend.
+5. Re-test upload, query, logs, and document persistence after deployment.
 
 ## Evaluation
 1) Create an eval file like `backend/evals/sample_eval.csv`.
