@@ -1,15 +1,14 @@
-import json
 import re
 import uuid
 from pathlib import Path
 from time import perf_counter
 
-import requests
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT_SECONDS
+from app.config import LLM_MODEL, LLM_PROVIDER
 from app.core.document_store import get_document_store
+from app.core.llm_provider import generate_text
 from app.core.rag_logger import (
     get_app_logger,
     log_query_event,
@@ -234,7 +233,8 @@ async def query_docs(request: QueryRequest):
             "query.received",
             {
                 "query": query,
-                "model": OLLAMA_MODEL,
+                "provider": LLM_PROVIDER,
+                "model": LLM_MODEL,
             },
             trace_id=trace_id,
         )
@@ -267,7 +267,8 @@ async def query_docs(request: QueryRequest):
                     "retrieved": [],
                     "answer": answer,
                     "abstained": True,
-                    "model": OLLAMA_MODEL,
+                    "provider": LLM_PROVIDER,
+                    "model": LLM_MODEL,
                     "duration_ms": round((perf_counter() - start) * 1000, 2),
                 }
             )
@@ -301,7 +302,8 @@ async def query_docs(request: QueryRequest):
                         "retrieved": _serialize_retrieved_chunks(top_chunks),
                         "answer": answer,
                         "abstained": True,
-                        "model": OLLAMA_MODEL,
+                        "provider": LLM_PROVIDER,
+                        "model": LLM_MODEL,
                         "duration_ms": round((perf_counter() - start) * 1000, 2),
                     }
                 )
@@ -344,7 +346,8 @@ async def query_docs(request: QueryRequest):
                         "retrieved": _serialize_retrieved_chunks(top_chunks),
                         "answer": output,
                         "abstained": False,
-                        "model": OLLAMA_MODEL,
+                        "provider": LLM_PROVIDER,
+                        "model": LLM_MODEL,
                         "rule_hit": "role_for_org",
                         "duration_ms": round((perf_counter() - start) * 1000, 2),
                     }
@@ -383,46 +386,16 @@ Answer:
             trace_id=trace_id,
         )
 
-        ollama_start = perf_counter()
-        response = requests.post(
-            f"{OLLAMA_BASE_URL}/api/generate",
-            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-            timeout=OLLAMA_TIMEOUT_SECONDS,
-        )
-
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Ollama returned status {response.status_code}",
-            )
-
-        try:
-            payload = response.json()
-            output = payload.get("response", "")
-        except ValueError:
-            lines = [line for line in response.text.splitlines() if line.strip()]
-            if not lines:
-                raise HTTPException(status_code=500, detail="Empty response from Ollama API")
-            output_parts = []
-            for line in lines:
-                try:
-                    chunk_payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if "response" in chunk_payload:
-                    output_parts.append(chunk_payload["response"])
-            if not output_parts:
-                raise HTTPException(status_code=500, detail="Invalid JSON from Ollama API")
-            output = "".join(output_parts)
-
+        output, llm_duration_ms = generate_text(prompt)
         output = _normalize_answer(output)
-        ollama_duration_ms = round((perf_counter() - ollama_start) * 1000, 2)
 
         log_trace_event(
-            "query.ollama_response",
+            "query.llm_response",
             {
                 "query": query,
-                "duration_ms": ollama_duration_ms,
+                "provider": LLM_PROVIDER,
+                "model": LLM_MODEL,
+                "duration_ms": llm_duration_ms,
                 "answer_preview": preview_text(output, 400),
             },
             trace_id=trace_id,
@@ -453,8 +426,9 @@ Answer:
                 "retrieved": _serialize_retrieved_chunks(top_chunks),
                 "answer": output,
                 "abstained": output == "I don't know.",
-                "model": OLLAMA_MODEL,
-                "ollama_duration_ms": ollama_duration_ms,
+                "provider": LLM_PROVIDER,
+                "model": LLM_MODEL,
+                "llm_duration_ms": llm_duration_ms,
                 "duration_ms": total_duration_ms,
             }
         )

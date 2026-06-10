@@ -3,6 +3,7 @@ from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from time import perf_counter
 
+from app.config import LLM_MODEL, LLM_PROVIDER
 from app.core.rag_logger import get_app_logger
 from app.routes import documents, query, upload
 
@@ -20,6 +21,11 @@ app.add_middleware(
 app.include_router(upload.router, prefix="/api")
 app.include_router(query.router, prefix="/api")
 app.include_router(documents.router, prefix="/api")
+
+
+@app.on_event("startup")
+def log_runtime_configuration():
+    logger.info("LLM provider=%s model=%s", LLM_PROVIDER, LLM_MODEL)
 
 
 @app.middleware("http")
@@ -44,4 +50,8 @@ async def log_requests(request: Request, call_next):
 
 @app.get("/")
 def root():
-    return {"message": "RAG Backend is running!"}
+    return {
+        "message": "RAG Backend is running!",
+        "llm_provider": LLM_PROVIDER,
+        "llm_model": LLM_MODEL,
+    }

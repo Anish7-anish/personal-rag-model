@@ -1,14 +1,16 @@
 # personal-rag-model
-Personal RAG app: build a persistent corpus about yourself, then query it locally with Ollama.
+Personal RAG app: build a persistent corpus about yourself, then query it with local retrieval and either Groq or Ollama for final answer generation.
 
 ## Quickstart
-Backend (FastAPI + local SQLite corpus store + Ollama):
+Backend (FastAPI + local SQLite corpus store + Groq free tier):
 ```bash
 cd backend
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-export OLLAMA_MODEL=llama3
+# if backend/.env does not exist yet:
+# cp .env.example .env
+# otherwise edit backend/.env and add your real GROQ_API_KEY
 uvicorn app.main:app --reload
 ```
 
@@ -27,9 +29,14 @@ npm run preview
 ```
 
 ## Configuration
-- `OLLAMA_MODEL`: defaults to `llama3`. Set in `.env` or your shell.
+- `LLM_PROVIDER`: `groq` or `ollama`. If omitted, the backend auto-selects `groq` when `GROQ_API_KEY` is present and falls back to `ollama` otherwise.
+- `LLM_MODEL`: optional explicit model override.
+- `LLM_BASE_URL`: optional explicit base URL override.
+- `LLM_TIMEOUT_SECONDS`: defaults to `120`.
+- `GROQ_API_KEY`: required for Groq.
+- `GROQ_MODEL`: defaults to `llama-3.1-8b-instant` for free-tier usage.
+- `OLLAMA_MODEL`: defaults to `llama3` for local fallback.
 - `OLLAMA_BASE_URL`: defaults to `http://127.0.0.1:11434`.
-- `OLLAMA_TIMEOUT_SECONDS`: defaults to `120`.
 - `LOG_LEVEL`: defaults to `INFO`.
 - `VITE_API_BASE_URL`: defaults to `http://localhost:8000/api` for the frontend.
 
@@ -37,7 +44,28 @@ npm run preview
 - Uploaded files are stored in `backend/data/uploads/`.
 - Parsed chunks and document metadata are persisted in `backend/data/rag_store.sqlite3`.
 - The corpus survives backend restarts.
-- Ollama is used only for final answer generation; retrieval is local and does not require downloading embedding models.
+- Retrieval is local and does not require downloading embedding models.
+- Final answer generation uses Groq when `GROQ_API_KEY` is configured, otherwise Ollama.
+
+## Groq Free Tier
+Recommended free-tier model:
+- `llama-3.1-8b-instant`
+
+You can switch to another Groq model by changing `LLM_MODEL` in `backend/.env`.
+
+Example:
+```bash
+cd backend
+# if needed: cp .env.example .env
+# edit .env and paste your GROQ_API_KEY
+uvicorn app.main:app --reload
+```
+
+Then verify the backend selected Groq:
+```bash
+curl http://127.0.0.1:8000/
+```
+You should see `llm_provider: groq` in the JSON response.
 
 ## Add Documents
 From the UI:
